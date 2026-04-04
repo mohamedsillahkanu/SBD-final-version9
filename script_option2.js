@@ -473,22 +473,130 @@ function clearCount(id) {
 // ============================================
 // SCHOOL SUBMISSION CHECK
 // ============================================
+// ── Duplicate check state ────────────────────────────────────
+// Tracks the async online check result for the currently selected school
+const _dupCheck = {
+    key:       null,   // key being checked
+    pending:   false,  // GAS request in flight
+    duplicate: false,  // result: is it a duplicate?
+    source:    null    // 'local' | 'online'
+};
+
+// ── Check GAS for duplicate (online) ────────────────────────
+async function checkDuplicateOnline(key) {
+    if (!key || !state.isOnline) return false;
+    try {
+        const parts = key.split('|'); // district|chiefdom|section|facility|community|school
+        const params = new URLSearchParams({
+            action:    'checkDuplicate',
+            district:  parts[0] || '',
+            chiefdom:  parts[1] || '',
+            section:   parts[2] || '',
+            facility:  parts[3] || '',
+            community: parts[4] || '',
+            school:    parts[5] || ''
+        });
+        const res = await Promise.race([
+            fetch(CONFIG.SCRIPT_URL + '?' + params.toString()),
+            new Promise((_,rej) => setTimeout(() => rej(new Error('timeout')), 5000))
+        ]);
+        if (!res.ok) return false;
+        const data = await res.json();
+        return !!data.exists;
+    } catch(e) {
+        console.warn('[DupCheck] Online check failed:', e.message);
+        return false; // fail open — don't block if GAS unreachable
+    }
+}
+
+// ── Central duplicate check (local first, then online) ───────
+async function isDuplicateSubmission(key) {
+    if (!key) return { duplicate: false, source: null };
+
+    // 1. Check localStorage / session
+    if (isSchoolSubmitted(key)) {
+        return { duplicate: true, source: 'local' };
+    }
+
+    // 2. Check pending (offline queue)
+    const inPending = state.pendingSubmissions.some(r => {
+        return makeSchoolKey(r.district, r.chiefdom, r.section_loc,
+                             r.facility, r.community, r.school_name) === key;
+    });
+    if (inPending) return { duplicate: true, source: 'pending' };
+
+    // 3. Check already-fetched sheet rows from analysis (if available)
+    if (window._sheetRows && window._sheetRows.length > 0) {
+        const inSheet = window._sheetRows.some(r =>
+            makeSchoolKey(r.district, r.chiefdom, r.section_loc,
+                          r.facility, r.community, r.school_name) === key
+        );
+        if (inSheet) return { duplicate: true, source: 'online' };
+    }
+
+    // 4. Ask GAS directly
+    const onlineDup = await checkDuplicateOnline(key);
+    if (onlineDup) return { duplicate: true, source: 'online' };
+
+    return { duplicate: false, source: null };
+}
+
 function setupSchoolSubmissionCheck() {
     const schoolSel = document.getElementById('school_name');
     if (!schoolSel) return;
-    schoolSel.addEventListener('change', function() {
+
+    schoolSel.addEventListener('change', async function() {
         const key = currentSchoolKey();
-        if (!key) return;
-        const banner = document.getElementById('schoolSubmittedBanner');
-        if (isSchoolSubmitted(key)) {
-            if (!banner) injectSubmittedBanner();
+
+        // Reset state when school changes
+        _dupCheck.key       = key;
+        _dupCheck.duplicate = false;
+        _dupCheck.source    = null;
+        _dupCheck.pending   = false;
+
+        const banner  = document.getElementById('schoolSubmittedBanner');
+        const nextBtn = document.querySelector('.form-section[data-section="2"] .btn-next');
+
+        if (!key) {
+            if (banner)  banner.style.display = 'none';
+            if (nextBtn) { nextBtn.disabled = false; nextBtn.title = ''; }
+            return;
+        }
+
+        // Show a subtle checking indicator on the Next button
+        if (nextBtn) {
+            nextBtn.disabled = true;
+            nextBtn.title    = 'Checking for duplicate submission…';
+        }
+        _dupCheck.pending = true;
+
+        const { duplicate, source } = await isDuplicateSubmission(key);
+
+        // Only act if the user hasn't changed school while we were checking
+        if (_dupCheck.key !== key) return;
+
+        _dupCheck.pending   = false;
+        _dupCheck.duplicate = duplicate;
+        _dupCheck.source    = source;
+
+        if (duplicate) {
+            if (!document.getElementById('schoolSubmittedBanner')) injectSubmittedBanner();
             const b = document.getElementById('schoolSubmittedBanner');
-            if (b) b.style.display = 'flex';
-            const nextBtn = document.querySelector('.form-section[data-section="2"] .btn-next');
-            if (nextBtn) { nextBtn.disabled = true; nextBtn.title = 'This school has already been submitted'; }
+            if (b) {
+                // Update message based on source
+                const srcLabel = source === 'online'  ? '(confirmed on Google Sheet)' :
+                                 source === 'pending' ? '(in offline queue)'          :
+                                                        '(submitted this session)';
+                const msgEl = b.querySelector('.dup-source-msg');
+                if (msgEl) msgEl.textContent = srcLabel;
+                b.style.display = 'flex';
+            }
+            if (nextBtn) {
+                nextBtn.disabled = true;
+                nextBtn.title    = 'This school has already been submitted — duplicate entry not allowed.';
+            }
         } else {
-            if (banner) banner.style.display = 'none';
-            const nextBtn = document.querySelector('.form-section[data-section="2"] .btn-next');
+            if (banner)  banner.style.display = 'none';
             if (nextBtn) { nextBtn.disabled = false; nextBtn.title = ''; }
         }
     });
@@ -499,17 +607,33 @@ function injectSubmittedBanner() {
     if (!section2) return;
     const banner = document.createElement('div');
     banner.id = 'schoolSubmittedBanner';
-    banner.style.cssText = 'display:none;background:#fff0f0;border:2px solid #dc3545;border-radius:8px;padding:14px 16px;margin-bottom:16px;align-items:center;gap:12px;';
+    banner.style.cssText = [
+        'display:none',
+        'background:#fff0f0',
+        'border:2px solid #dc3545',
+        'border-radius:10px',
+        'padding:14px 16px',
+        'margin-bottom:16px',
+        'align-items:flex-start',
+        'gap:12px'
+    ].join(';');
     banner.innerHTML = `
-      <svg style="width:22px;height:22px;stroke:#dc3545;flex-shrink:0" viewBox="0 0 24 24" fill="none" stroke-width="2">
-        <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+      <svg style="width:28px;height:28px;stroke:#dc3545;flex-shrink:0;margin-top:2px" viewBox="0 0 24 24" fill="none" stroke-width="2">
+        <circle cx="12" cy="12" r="10"/>
+        <line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/>
       </svg>
-      <div>
-        <div style="font-size:13px;font-weight:700;color:#c0392b;text-transform:uppercase;letter-spacing:.5px;">ALREADY SUBMITTED</div>
-        <div style="font-size:12px;color:#555;margin-top:2px;">
-          This school has already been submitted.
-          <a href="#" onclick="viewSubmittedSchoolFromBanner(); return false;"
-             style="color:#004080;font-weight:600;text-decoration:underline;">View submission details</a>
+      <div style="flex:1;">
+        <div style="font-size:13px;font-weight:700;color:#c0392b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">
+          ⛔ DUPLICATE — SUBMISSION NOT ALLOWED
+        </div>
+        <div style="font-size:12px;color:#555;line-height:1.6;">
+          This school has <strong>already been submitted</strong> with the same District, Chiefdom, Section, PHU, Community and School Name.
+          <span class="dup-source-msg" style="color:#004080;font-weight:600;"></span>
+          <br>Please choose a <strong>different school</strong> or contact your supervisor.
+          <br><a href="#" onclick="viewSubmittedSchoolFromBanner(); return false;"
+             style="color:#004080;font-weight:600;text-decoration:underline;margin-top:4px;display:inline-block;">
+             View existing submission details →
+          </a>
         </div>
       </div>`;
     const nav = section2.querySelector('.navigation-buttons');
@@ -932,8 +1056,12 @@ function validateCurrentSection() {
 
     if (state.currentSection === 2) {
         const key = currentSchoolKey();
-        if (key && isSchoolSubmitted(key)) {
-            showNotification('This school has already been submitted. Choose a different school.', 'error');
+        // Use cached result from async check — or re-check local synchronously
+        if (key && (_dupCheck.duplicate || isSchoolSubmitted(key))) {
+            const src = _dupCheck.source === 'online' ? ' (confirmed on Google Sheet)' :
+                        _dupCheck.source === 'pending' ? ' (in offline queue)' :
+                        ' (submitted this session)';
+            showNotification('⛔ Duplicate entry blocked — this school has already been submitted' + src + '.', 'error');
             return false;
         }
     }
@@ -1357,21 +1485,69 @@ window.finalizeForm = function() {
 async function handleSubmit(e) {
     e.preventDefault();
     if(state.formStatus!=='finalized'){ showNotification('Please finalize the form first.','error'); return; }
+
     const formData=new FormData(e.target);
     const data={timestamp:new Date().toISOString(),submitted_by:state.currentUser||''};
     for(const [k,v] of formData.entries()) data[k]=v;
     const pbo=document.getElementById('itn_type_pbo'), ig2=document.getElementById('itn_type_ig2');
     data.itn_type_pbo=pbo&&pbo.checked?'Yes':'No';
     data.itn_type_ig2=ig2&&ig2.checked?'Yes':'No';
+
+    // ── FINAL DUPLICATE GUARD ──────────────────────────────
+    // Re-check one last time (catches any race condition between
+    // school selection and reaching submit).
+    const submitKey = makeSchoolKey(
+        data.district, data.chiefdom, data.section_loc,
+        data.facility, data.community, data.school_name
+    );
+
     const submitBtn=document.getElementById('submitBtn');
-    if(submitBtn){ submitBtn.disabled=true; submitBtn.innerHTML='<svg class="nav-icon spinning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg> SUBMITTING...'; }
+    if(submitBtn){ submitBtn.disabled=true; submitBtn.innerHTML='<svg class="nav-icon spinning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg> CHECKING...'; }
+
+    const { duplicate: isDup, source: dupSrc } = await isDuplicateSubmission(submitKey);
+    if (isDup) {
+        const srcLabel = dupSrc === 'online'  ? ' — found on Google Sheet'   :
+                         dupSrc === 'pending' ? ' — already in offline queue' :
+                                                ' — submitted this session';
+        showNotification('⛔ DUPLICATE BLOCKED: This school was already submitted' + srcLabel + '.', 'error');
+
+        // Scroll back to section 2 so user can see the banner
+        document.querySelectorAll('.form-section').forEach(s=>s.classList.remove('active'));
+        state.currentSection = 2;
+        document.querySelector('.form-section[data-section="2"]')?.classList.add('active');
+        updateProgress();
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+
+        // Make sure banner is visible
+        if (!document.getElementById('schoolSubmittedBanner')) injectSubmittedBanner();
+        const b = document.getElementById('schoolSubmittedBanner');
+        if (b) {
+            const msgEl = b.querySelector('.dup-source-msg');
+            if (msgEl) msgEl.textContent = srcLabel.replace(' — ', ' ');
+            b.style.display = 'flex';
+        }
+        const nextBtn = document.querySelector('.form-section[data-section="2"] .btn-next');
+        if (nextBtn) { nextBtn.disabled = true; nextBtn.title = 'Duplicate — submission blocked.'; }
+
+        state.formStatus = 'draft';
+        const formStatus = document.getElementById('form_status');
+        if (formStatus) formStatus.value = 'draft';
+        const finalizeBtn = document.getElementById('finalizeBtn');
+        if (finalizeBtn) finalizeBtn.disabled = false;
+        if(submitBtn){ submitBtn.disabled=true; submitBtn.innerHTML='<svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg> SUBMIT'; }
+        return;
+    }
+    // ── END DUPLICATE GUARD ────────────────────────────────
+
+    if(submitBtn){ submitBtn.innerHTML='<svg class="nav-icon spinning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg> SUBMITTING...'; }
+
     if(state.isOnline){
         try{
             await fetch(CONFIG.SCRIPT_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
             markSchoolSubmitted(data);
             if(state.currentDraftId) state.drafts=state.drafts.filter(d=>d.draftId!==state.currentDraftId);
             saveToStorage(); updateCounts(); updateSummaryBadge();
-            showNotification('Submitted successfully!','success'); resetForm();
+            showNotification('✅ Submitted successfully!','success'); resetForm();
         } catch(err){ saveOffline(data); }
     } else { saveOffline(data); }
     if(submitBtn){ submitBtn.disabled=false; submitBtn.innerHTML='<svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg> SUBMIT'; }
